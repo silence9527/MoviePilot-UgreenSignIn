@@ -8,21 +8,27 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from apscheduler.triggers.cron import CronTrigger
 
-from app.schemas.types import NotificationType
+try:
+    # V3 后期把 NotificationType 改名为 MessageType，两者取值一致。
+    from app.schemas.types import MessageType as NotificationType
+except ImportError:  # pragma: no cover - 兼容早期 V3 构建
+    from app.schemas.types import NotificationType
+
 from app.sdk import scheduler as scheduler_sdk
 from app.sdk.logging import logger
 from app.sdk.plugin import _PluginBase
 
-from .client import CheckinError, CookieExpiredError, UgreenCheckinClient
+from .client import CheckinError, CookieExpiredError, CheckinStats, UgreenCheckinClient
+from .message import build_notification
 
 
 class UgreenSignIn(_PluginBase):
     """定时完成绿联社区每日签到，并保存可检查的执行结果。"""
 
     plugin_name = "绿联论坛签到"
-    plugin_desc = "通过论坛真实签到页自动打卡，支持定时执行、结果复核、通知和历史记录。"
+    plugin_desc = "通过论坛真实签到页自动打卡，支持定时执行、积分统计、结果复核、通知和历史记录。"
     plugin_icon = "https://raw.githubusercontent.com/silence9527/MoviePilot-UgreenSignIn/main/icons/ugreen.svg"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "silence9527"
     author_url = "https://github.com/silence9527"
     plugin_config_prefix = "ugreensignin_"
@@ -114,7 +120,7 @@ class UgreenSignIn(_PluginBase):
             if not self._cookie:
                 raise CookieExpiredError("请先配置论坛 Cookie")
             result = UgreenCheckinClient(timeout=self._timeout).checkin(self._cookie)
-            record = self._result(result.status, result.message)
+            record = self._result(result.status, result.message, result.stats)
         except CookieExpiredError as err:
             record = self._result("failed", str(err))
         except CheckinError as err:
@@ -129,17 +135,36 @@ class UgreenSignIn(_PluginBase):
         log_method = logger.error if record["status"] == "failed" else logger.info
         log_method(f"绿联论坛签到：{record['message']}")
         if self._notify and record["status"] != "skipped":
-            title = "绿联论坛签到失败" if record["status"] == "failed" else "绿联论坛签到"
-            text = f"结果：{record['message']}\n时间：{record['time']}"
-            try:
+            self._send_notification(record)
+        return record
+
+    def _send_notification(self, record: Dict[str, Any]) -> None:
+        """发送通知。宿主支持结构化内容时带上，失败则退回纯文本。"""
+        title, text, rich_content = build_notification(record)
+        try:
+            if rich_content is not None:
                 self.post_message(
-                    mtype=NotificationType.SiteMessage,
+                    mtype=NotificationType.Plugin,
+                    title=title,
+                    text=text,
+                    rich_content=rich_content,
+                )
+            else:
+                self.post_message(
+                    mtype=NotificationType.Plugin,
                     title=title,
                     text=text,
                 )
-            except Exception as err:
-                logger.error(f"绿联论坛签到：通知发送失败 {err}")
-        return record
+        except Exception as err:
+            logger.error(f"绿联论坛签到：结构化通知发送失败，改用纯文本 {err}")
+            try:
+                self.post_message(
+                    mtype=NotificationType.Plugin,
+                    title=title,
+                    text=text,
+                )
+            except Exception as plain_err:
+                logger.error(f"绿联论坛签到：通知发送失败 {plain_err}")
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """返回插件配置表单。"""
@@ -191,7 +216,8 @@ class UgreenSignIn(_PluginBase):
                                 "props": {
                                     "type": "info",
                                     "variant": "tonal",
-                                    "text": "使用论坛 ugreen_checkin 独立签到页。插件点击签到后会刷新页面复核；"
+                                    "text": "使用论坛 ugreen_checkin 独立签到页。插件点击签到后会刷新页面复核，"
+                                            "并顺带读取积分余额与今日签到积分写入通知；"
                                             "今日已签到不会重复提交。Cookie 失效时请重新登录论坛并更新。",
                                 },
                             }],
@@ -244,7 +270,7 @@ class UgreenSignIn(_PluginBase):
                 "type": alert_type,
                 "variant": "tonal",
                 "title": str(latest.get("message") or "暂无结果"),
-                "text": f"最近执行时间：{latest.get('time') or '未知'}",
+                "text": self._latest_summary(latest),
                 "class": "mb-4",
             },
         }]
@@ -271,6 +297,7 @@ class UgreenSignIn(_PluginBase):
                         }],
                     },
                     {"component": "td", "text": str(item.get("message") or "-")},
+                    {"component": "td", "text": self._points_label(item)},
                 ],
             })
 
@@ -292,6 +319,7 @@ class UgreenSignIn(_PluginBase):
                                         {"component": "th", "text": "时间"},
                                         {"component": "th", "text": "状态"},
                                         {"component": "th", "text": "结果"},
+                                        {"component": "th", "text": "积分"},
                                     ],
                                 }],
                             },
@@ -322,12 +350,24 @@ class UgreenSignIn(_PluginBase):
         self.save_data("history", history[-self._history_limit:])
 
     @staticmethod
-    def _result(status: str, message: str) -> Dict[str, Any]:
-        return {
+    def _result(status: str, message: str,
+                stats: Optional[CheckinStats] = None) -> Dict[str, Any]:
+        """把签到结果整理成可持久化的记录，积分缺失时不写空字段。"""
+        record: Dict[str, Any] = {
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "status": status,
             "message": message,
         }
+        if stats:
+            if stats.balance is not None:
+                record["balance"] = stats.balance
+            if stats.today_gain is not None:
+                record["today_gain"] = stats.today_gain
+            if stats.today_total is not None:
+                record["today_total"] = stats.today_total
+            if stats.streak is not None:
+                record["streak"] = stats.streak
+        return record
 
     @staticmethod
     def _status_label(status: str) -> str:
@@ -337,6 +377,33 @@ class UgreenSignIn(_PluginBase):
             "failed": "失败",
             "skipped": "已跳过",
         }.get(status, "未知")
+
+    @staticmethod
+    def _latest_summary(latest: Dict[str, Any]) -> str:
+        """详情页顶部的最近结果摘要，带积分信息。"""
+        parts = [f"最近执行时间：{latest.get('time') or '未知'}"]
+        gain = latest.get("today_gain")
+        if isinstance(gain, int):
+            parts.append(f"今日签到 {gain:+d} 积分")
+        balance = latest.get("balance")
+        if isinstance(balance, int):
+            parts.append(f"当前余额 {balance} 积分")
+        streak = latest.get("streak")
+        if isinstance(streak, int):
+            parts.append(f"连续签到 {streak} 天")
+        return " · ".join(parts)
+
+    @staticmethod
+    def _points_label(item: Dict[str, Any]) -> str:
+        """表格里的积分列，读不到时显示占位符。"""
+        gain = item.get("today_gain")
+        balance = item.get("balance")
+        chunks = []
+        if isinstance(gain, int):
+            chunks.append(f"本次 {gain:+d}")
+        if isinstance(balance, int):
+            chunks.append(f"余额 {balance}")
+        return " · ".join(chunks) or "-"
 
     @staticmethod
     def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
