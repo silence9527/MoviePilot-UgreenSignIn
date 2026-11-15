@@ -1,0 +1,17 @@
+{
+  "UgreenSignIn": {
+    "name": "绿联论坛签到",
+    "description": "通过论坛真实签到页自动打卡，支持定时执行、结果复核、通知和历史记录。",
+    "labels": "签到,绿联,论坛,UGREEN",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/silence9527/MoviePilot-UgreenSignIn/main/icons/ugreen.svg",
+    "author": "silence9527",
+    "author_url": "https://github.com/silence9527",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "plugin_readme": "https://github.com/silence9527/MoviePilot-UgreenSignIn/blob/main/plugins.v3/ugreensignin/README.md",
+    "history": {
+      "v1.0.0": "首个 V3 版本，适配 ugreen_checkin 独立签到页，支持 Cookie 校验、签到后复核、通知和历史记录。"
+    }
+  }
+}
